@@ -20,8 +20,8 @@ powered by LangGraph.
    export OPENAI_API_KEY="sk-your-key"
    ```
 
-   You can substitute the model provider by editing
-   [`initialize_llm`](../examples/deep_agent/main.py#L27) to use a different
+  You can substitute the model provider by editing
+  [`initialize_llm`](../examples/deep_agent/main.py#L27) to use a different
    LangChain chat model wrapper.
 
 ## How the example works
@@ -30,14 +30,14 @@ The script is divided into sectioned helpers that map directly to the structure
 of the code:
 
 - **Model setup** – [`initialize_llm`](../examples/deep_agent/main.py#L27) and
-  [`initialize_tools`](../examples/deep_agent/main.py#L44) configure the shared
+  [`initialize_tools`](../examples/deep_agent/main.py#L49) configure the shared
   chat model and utility tools that every agent can access.
-- **Graph definition** – [`build_sub_agent_graph`](../examples/deep_agent/main.py#L81)
+- **Graph definition** – [`build_sub_agent_graph`](../examples/deep_agent/main.py#L101)
   uses LangGraph to define reusable sub-agents with plan/act/report nodes.
-- **Agent registration** – [`build_primary_agent`](../examples/deep_agent/main.py#L136)
-  and [`create_sub_agent_tool`](../examples/deep_agent/main.py#L155) register the
+- **Agent registration** – [`build_primary_agent`](../examples/deep_agent/main.py#L164)
+  and [`create_sub_agent_tool`](../examples/deep_agent/main.py#L192) register the
   LangGraph workflows as tools that the primary `AgentExecutor` can call.
-- **Execution flow** – [`run_example`](../examples/deep_agent/main.py#L172)
+- **Execution flow** – [`run_example`](../examples/deep_agent/main.py#L210)
   shows how the coordinator agent assembles the system and invokes a task.
 
 Each of these helpers is documented inline in the script so you can match the
@@ -64,12 +64,12 @@ To add additional sub-agents:
 
 1. Create a new `SubAgentConfig` with the desired name, tools, and model
    configuration.
-2. Call [`build_sub_agent_graph`](../examples/deep_agent/main.py#L81) to compile
+2. Call [`build_sub_agent_graph`](../examples/deep_agent/main.py#L101) to compile
    a new LangGraph workflow.
-3. Wrap the compiled graph with [`create_sub_agent_tool`](../examples/deep_agent/main.py#L155)
+3. Wrap the compiled graph with [`create_sub_agent_tool`](../examples/deep_agent/main.py#L192)
    and append the resulting tool to the list passed into
-   [`build_primary_agent`](../examples/deep_agent/main.py#L136).
-4. Update [`run_example`](../examples/deep_agent/main.py#L172) to include the new
+   [`build_primary_agent`](../examples/deep_agent/main.py#L164).
+4. Update [`run_example`](../examples/deep_agent/main.py#L210) to include the new
    tool in `delegation_tools`.
 
 Following this pattern keeps the control flow explicit and makes it easy to
