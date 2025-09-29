@@ -13,6 +13,9 @@ LangGraph workflows.
 - [`examples/deep_agent/main.py`](examples/deep_agent/main.py) expands on that
   foundation by introducing a coordinating `AgentExecutor` that can dispatch to
   multiple LangGraph sub-agents.
+- [`examples/claude_agent_sdk/main.py`](examples/claude_agent_sdk/main.py)
+  showcases the Claude Agent SDK with in-process MCP tools and the streaming
+  `ClaudeSDKClient`.
 
 ## Getting started
 
