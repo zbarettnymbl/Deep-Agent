@@ -5,6 +5,15 @@ and LangGraph. The highlighted example demonstrates how a primary
 `AgentExecutor` can delegate work to specialized sub-agents implemented as
 LangGraph workflows.
 
+## Examples
+
+- [`examples/langgraph_basic/main.py`](examples/langgraph_basic/main.py) shows a
+  minimal LangGraph workflow that relies on inline tools and a single agent
+  node—no `AgentExecutor` required.
+- [`examples/deep_agent/main.py`](examples/deep_agent/main.py) expands on that
+  foundation by introducing a coordinating `AgentExecutor` that can dispatch to
+  multiple LangGraph sub-agents.
+
 ## Getting started
 
 1. Install dependencies and configure an OpenAI compatible API key as described
