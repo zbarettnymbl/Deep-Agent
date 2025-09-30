@@ -172,6 +172,23 @@ class OutlookClient:
             emails.append(self._build_email_record(item))
         return emails
 
+    def fetch_flagged_follow_ups(self, *, max_items: int = 50) -> List[Dict[str, Any]]:
+        """Fetch unread or flagged messages that may require follow-up."""
+
+        params = {
+            "$top": str(max_items),
+            "$orderby": "receivedDateTime desc",
+            "$select": (
+                "id,subject,from,receivedDateTime,importance,isRead,flag,webLink"
+            ),
+            "$filter": "(isRead eq false) or (flag/flagStatus eq 'flagged')",
+        }
+        data = self._authorized_get(f"{GRAPH_BASE_URL}/me/messages", params)
+        messages: List[Dict[str, Any]] = []
+        for item in data.get("value", []):
+            messages.append(self._build_email_record(item))
+        return messages
+
     def _build_email_record(self, item: Dict[str, Any]) -> Dict[str, Any]:
         sender = item.get("from", {}).get("emailAddress", {})
         subject = item.get("subject", "(no subject)")
@@ -192,6 +209,7 @@ class OutlookClient:
         )
 
         return {
+            "id": item.get("id"),
             "subject": subject,
             "sender": sender_name,
             "sender_address": sender_address,
@@ -199,9 +217,57 @@ class OutlookClient:
             "importance": importance,
             "flag_status": flag_status,
             "due_date": due_date_iso,
+            "is_read": item.get("isRead", True),
+            "web_link": item.get("webLink"),
             "priority_score": score,
             "priority_reasons": reasons,
         }
+
+    def rank_follow_ups(
+        self,
+        messages: Sequence[Dict[str, Any]],
+        *,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Score and rank potential follow-up messages by urgency."""
+
+        ranked: List[Dict[str, Any]] = []
+        now = datetime.now(tz=UTC)
+
+        for message in messages:
+            score = int(message.get("priority_score") or 0)
+            reasons = list(message.get("priority_reasons", []))
+
+            if not message.get("is_read", True):
+                score += 1
+                reasons.append("Message is unread")
+
+            received_dt = self._parse_datetime(message.get("received"))
+            if received_dt is not None:
+                age = now - received_dt
+                if age >= timedelta(days=2):
+                    score += 2
+                    reasons.append("Received more than 48 hours ago")
+                elif age >= timedelta(days=1):
+                    score += 1
+                    reasons.append("Received more than 24 hours ago")
+
+            ranked.append(
+                {
+                    **message,
+                    "priority_score": score,
+                    "priority_reasons": reasons,
+                }
+            )
+
+        def sort_key(item: Dict[str, Any]) -> Tuple[int, datetime]:
+            received_dt = self._parse_datetime(item.get("received"))
+            if received_dt is None:
+                received_dt = datetime.min.replace(tzinfo=UTC)
+            return item.get("priority_score", 0), received_dt
+
+        ordered = sorted(ranked, key=sort_key, reverse=True)
+        return ordered[: max(1, limit)] if ordered else []
 
     def prioritized_previous_day_emails(self, *, limit: int = 5) -> List[Dict[str, Any]]:
         """Return the highest priority emails from the previous work day."""
@@ -432,6 +498,40 @@ class OutlookClient:
     def previous_day_calendar_summary(self) -> str:
         return self.summarize_events(self.fetch_previous_day_events())
 
+    def follow_up_recommendations(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Return high-priority follow-up messages with actionable metadata."""
+
+        candidates = self.fetch_flagged_follow_ups()
+        if not candidates:
+            return []
+
+        ranked = self.rank_follow_ups(candidates, limit=limit)
+        digest: List[Dict[str, Any]] = []
+        for message in ranked:
+            digest.append(
+                {
+                    "message_id": message.get("id"),
+                    "subject": message.get("subject"),
+                    "sender": message.get("sender"),
+                    "sender_address": message.get("sender_address"),
+                    "received": message.get("received"),
+                    "received_display": self._format_time(
+                        message.get("received"), default="Unknown time"
+                    ),
+                    "due_date": message.get("due_date"),
+                    "due_display": self._format_time(
+                        message.get("due_date"), default="No deadline"
+                    ),
+                    "importance": message.get("importance"),
+                    "flag_status": message.get("flag_status"),
+                    "is_read": message.get("is_read"),
+                    "web_link": message.get("web_link"),
+                    "priority_score": message.get("priority_score"),
+                    "priority_reasons": message.get("priority_reasons", []),
+                }
+            )
+        return digest
+
     def previous_day_briefing(self) -> str:
         """Combine email and calendar summaries into a single briefing."""
 
@@ -624,6 +724,16 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
             description="Maximum number of prioritized emails to return.",
         )
 
+    class FollowUpRecommendationsInput(BaseModel):
+        """Schema for retrieving urgent Outlook follow-up recommendations."""
+
+        limit: int = Field(
+            default=5,
+            ge=1,
+            le=25,
+            description="Maximum number of follow-up candidates to return.",
+        )
+
     class ReplyToMessageInput(BaseModel):
         """Schema for replying to an existing Outlook email."""
 
@@ -704,6 +814,11 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
         payload = {"top_priorities": digest, "limit": limit}
         return json.dumps(payload, indent=2)
 
+    def follow_up_recommendations_tool(limit: int = 5) -> str:
+        digest = client.follow_up_recommendations(limit=limit)
+        payload = {"follow_up_recommendations": digest, "limit": limit}
+        return json.dumps(payload, indent=2)
+
     tools: List[Tool] = [
         Tool(
             name="outlook_email_summary",
@@ -737,6 +852,16 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
             ),
             func=prioritized_email_tool,
             args_schema=TopEmailPrioritiesInput,
+        ),
+        StructuredTool.from_function(
+            name="outlook_follow_up_recommendations",
+            description=(
+                "Recommend unread or flagged Outlook messages that likely need action. "
+                "Each result includes message IDs for use with outlook_reply_to_message "
+                "or outlook_forward_message."
+            ),
+            func=follow_up_recommendations_tool,
+            args_schema=FollowUpRecommendationsInput,
         ),
         StructuredTool.from_function(
             name="outlook_send_mail",
