@@ -10,7 +10,7 @@ powered by LangGraph.
 2. **Dependencies** – Install the required packages:
 
    ```bash
-   pip install langchain langchain-openai langgraph
+   pip install langchain langchain-openai langgraph msal requests
    ```
 
 3. **API keys** – Export an OpenAI compatible API key so the example can invoke
@@ -24,6 +24,28 @@ powered by LangGraph.
   [`initialize_llm`](../examples/deep_agent/main.py#L27) to use a different
    LangChain chat model wrapper.
 
+4. **Microsoft Graph access** – Register a "web" app in the
+   [Azure portal](https://portal.azure.com/) and grant it the following
+   application permissions under Microsoft Graph:
+
+   - `Mail.Read`
+   - `Calendars.Read`
+
+   After granting admin consent, copy the app's **Client ID**, **Tenant ID**,
+   and **Client secret**. Export them as environment variables so the example
+   can authenticate through MSAL:
+
+   ```bash
+   export AZURE_CLIENT_ID="<app-client-id>"
+   export AZURE_TENANT_ID="<directory-tenant-id>"
+   export AZURE_CLIENT_SECRET="<client-secret>"
+   ```
+
+   These values are consumed by
+   [`create_outlook_tools`](../integrations/outlook.py#L214), which builds the
+   LangChain tools that summarize the previous workday's email and calendar
+   activity.
+
 ## How the example works
 
 The script is divided into sectioned helpers that map directly to the structure
@@ -31,7 +53,7 @@ of the code:
 
 - **Model setup** – [`initialize_llm`](../examples/deep_agent/main.py#L27) and
   [`initialize_tools`](../examples/deep_agent/main.py#L49) configure the shared
-  chat model and utility tools that every agent can access.
+  chat model and Outlook-derived tools that every agent can access.
 - **Graph definition** – [`build_sub_agent_graph`](../examples/deep_agent/main.py#L101)
   uses LangGraph to define reusable sub-agents with plan/act/report nodes.
 - **Agent registration** – [`build_primary_agent`](../examples/deep_agent/main.py#L164)
@@ -53,10 +75,14 @@ narrative in this guide with the implementation details.
    ```
 
 3. The script prints the final response from the primary agent after delegating
-   work to the research and writing sub-agents.
+   work to the research and writing sub-agents. When the Outlook integration is
+   configured, the agent can call tools that summarize the previous workday's
+   emails and calendar events.
 
-If you run into authentication errors, double-check that your `OPENAI_API_KEY`
-environment variable is exported in the shell that launches the script.
+If you run into authentication errors, double-check that the `OPENAI_API_KEY`,
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_CLIENT_SECRET` environment
+variables are exported in the shell that launches the script. The script will
+raise a descriptive error if the Outlook integration is missing credentials.
 
 ## Extending the example
 
