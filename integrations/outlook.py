@@ -12,7 +12,7 @@ import os
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import msal
 import requests
@@ -150,6 +150,32 @@ class OutlookClient:
         end = start + timedelta(days=1)
         return {"start": start, "end": end}
 
+    def fetch_flagged_follow_ups(self, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Fetch unread or flagged messages that may need follow up."""
+
+        params = {
+            "$top": str(limit),
+            "$orderby": "receivedDateTime desc",
+            "$select": "id,subject,from,receivedDateTime,importance,isRead,flag",
+            "$filter": "(isRead eq false) or (flag/flagStatus eq 'flagged')",
+        }
+        data = self._authorized_get(f"{GRAPH_BASE_URL}/me/messages", params)
+        follow_ups: List[Dict[str, Any]] = []
+        for item in data.get("value", []):
+            sender = item.get("from", {}).get("emailAddress", {})
+            follow_ups.append(
+                {
+                    "id": item.get("id"),
+                    "subject": item.get("subject", "(no subject)"),
+                    "sender": sender.get("name") or sender.get("address") or "Unknown",
+                    "received": item.get("receivedDateTime"),
+                    "importance": (item.get("importance") or "normal").lower(),
+                    "is_read": bool(item.get("isRead", False)),
+                    "flag_status": (item.get("flag") or {}).get("flagStatus", "notFlagged"),
+                }
+            )
+        return follow_ups
+
     def fetch_previous_day_emails(self) -> List[Dict[str, str]]:
         """Return structured metadata for emails received on the previous work day."""
 
@@ -244,6 +270,61 @@ class OutlookClient:
         except ValueError:
             return default
         return dt.astimezone(UTC).strftime("%H:%M UTC")
+
+    @staticmethod
+    def _parse_time(iso_ts: Optional[str]) -> Optional[datetime]:
+        if not iso_ts:
+            return None
+        sanitized = iso_ts.replace("Z", "+00:00") if iso_ts.endswith("Z") else iso_ts
+        try:
+            dt = datetime.fromisoformat(sanitized)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+
+    def rank_follow_ups(
+        self,
+        follow_ups: Sequence[Dict[str, Any]],
+        *,
+        top_n: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Prioritize follow-up messages using heuristics like flags, unread state, and age."""
+
+        importance_rank = {"high": 0, "normal": 1, "low": 2}
+        now = datetime.now(tz=UTC)
+        ranked: List[Dict[str, Any]] = []
+
+        def sort_key(item: Dict[str, Any]):
+            received_dt = self._parse_time(item.get("received")) or datetime.max.replace(tzinfo=UTC)
+            return (
+                0 if str(item.get("flag_status")).lower() == "flagged" else 1,
+                0 if not item.get("is_read") else 1,
+                importance_rank.get(str(item.get("importance")).lower(), 1),
+                received_dt,
+            )
+
+        for item in follow_ups:
+            received_dt = self._parse_time(item.get("received"))
+            age_hours: Optional[float] = None
+            if received_dt:
+                age_hours = max((now - received_dt).total_seconds() / 3600, 0)
+            reasons: List[str] = []
+            if str(item.get("flag_status")).lower() == "flagged":
+                reasons.append("flagged")
+            if not item.get("is_read"):
+                reasons.append("unread")
+            importance = str(item.get("importance") or "normal").lower()
+            if importance == "high":
+                reasons.append("high importance")
+            if age_hours is not None:
+                reasons.append(f"received {age_hours:.1f}h ago")
+
+            ranked.append({**item, "priority_reasons": ", ".join(reasons) or "recent message"})
+
+        ranked.sort(key=sort_key)
+        return ranked[: max(top_n, 0)]
 
     def previous_day_email_summary(self) -> str:
         return self.summarize_emails(self.fetch_previous_day_emails())
@@ -404,6 +485,39 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
     def daily_briefing_tool(_: str = "") -> str:
         return client.previous_day_briefing()
 
+    def follow_up_recommendations_tool(limit: int = 5) -> str:
+        fetch_limit = max(limit * 3, limit)
+        follow_ups = client.fetch_flagged_follow_ups(limit=fetch_limit)
+        ranked = client.rank_follow_ups(follow_ups, top_n=limit)
+        if not ranked:
+            return "No unread or flagged messages requiring follow-up were found."
+
+        lines = [
+            "Recommended Outlook follow-ups (use the message_id with reply or forward tools):"
+        ]
+        for item in ranked:
+            timestamp = client._format_time(item.get("received"), default="unknown time")
+            status_parts = []
+            if str(item.get("flag_status")).lower() == "flagged":
+                status_parts.append("flagged")
+            status_parts.append("unread" if not item.get("is_read") else "read")
+            status = ", ".join(status_parts)
+            lines.append(
+                "- {subject} from {sender} at {received} "
+                "(importance: {importance}; status: {status}; message_id: {message_id}; "
+                "reasons: {reasons})".format(
+                    subject=item.get("subject"),
+                    sender=item.get("sender"),
+                    received=timestamp,
+                    importance=item.get("importance"),
+                    status=status,
+                    message_id=item.get("id"),
+                    reasons=item.get("priority_reasons"),
+                )
+            )
+
+        return "\n".join(lines)
+
     class SendMailInput(BaseModel):
         """Schema for composing and sending a new Outlook email."""
 
@@ -508,6 +622,16 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
             description="Whether Outlook should send a response email.",
         )
 
+    class FollowUpRecommendationsInput(BaseModel):
+        """Schema for retrieving prioritized Outlook follow-up suggestions."""
+
+        limit: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="Number of follow-up recommendations to return (max 20).",
+        )
+
     tools: List[Tool] = [
         Tool(
             name="outlook_email_summary",
@@ -532,6 +656,16 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
                 "highlights with the calendar overview."
             ),
             func=daily_briefing_tool,
+        ),
+        StructuredTool.from_function(
+            name="outlook_follow_up_recommendations",
+            description=(
+                "Recommend high-priority Outlook messages that should be followed up. "
+                "Results include message_ids for pairing with outlook_reply_to_message "
+                "or outlook_forward_message."
+            ),
+            func=lambda limit=5: follow_up_recommendations_tool(limit=limit),
+            args_schema=FollowUpRecommendationsInput,
         ),
         StructuredTool.from_function(
             name="outlook_send_mail",
