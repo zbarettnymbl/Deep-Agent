@@ -11,6 +11,7 @@ from __future__ import annotations
 
 """Utilities for configuring language models and tools used by the agents."""
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, TypedDict
 
@@ -24,6 +25,9 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
 from integrations.outlook import OutlookIntegrationError, create_outlook_tools
+
+
+logger = logging.getLogger(__name__)
 
 def initialize_llm(
     *,
@@ -51,12 +55,15 @@ def initialize_tools() -> List[BaseTool]:
     """Define the shared tool set exposed to the agent ecosystem."""
 
     try:
-        return create_outlook_tools()
+        tools = create_outlook_tools()
     except OutlookIntegrationError as exc:  # pragma: no cover - example guardrail
         raise RuntimeError(
             "Outlook integration is not configured. "
             "Follow docs/deep_agent_example.md to provide Azure credentials."
         ) from exc
+
+    logger.info("Coordinator loaded tools: %s", ", ".join(tool.name for tool in tools))
+    return tools
 
 
 # --- Graph Definition ------------------------------------------------------
@@ -152,7 +159,11 @@ def build_primary_agent(llm: BaseChatModel, tools: Iterable[BaseTool]) -> AgentE
                 "system",
                 (
                     "You are the coordinator. When appropriate, call the provided tools "
-                    '"delegate_to_<name>" to request help from specialized sub-agents.'
+                    '"delegate_to_<name>" to request help from specialized sub-agents. "'
+                    "Use Outlook action tools (send, reply, forward, schedule meetings, "
+                    "respond to invites) only after the user has explicitly confirmed "
+                    "the intent, recipients, timing, and message contents. Always note "
+                    "that confirmation in your scratchpad before acting."
                 ),
             ),
             MessagesPlaceholder(variable_name="chat_history"),
