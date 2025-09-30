@@ -24,6 +24,10 @@ from langchain_core.tools import BaseTool, Tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
+from integrations.google_drive import (
+    GoogleDriveIntegrationError,
+    create_google_drive_tools,
+)
 from integrations.outlook import OutlookIntegrationError, create_outlook_tools
 
 
@@ -54,13 +58,29 @@ def initialize_llm(
 def initialize_tools() -> List[BaseTool]:
     """Define the shared tool set exposed to the agent ecosystem."""
 
+    tools: List[BaseTool] = []
+    configuration_errors: List[str] = []
+
     try:
-        tools = create_outlook_tools()
+        tools.extend(create_outlook_tools())
     except OutlookIntegrationError as exc:  # pragma: no cover - example guardrail
-        raise RuntimeError(
+        configuration_errors.append(
             "Outlook integration is not configured. "
             "Follow docs/deep_agent_example.md to provide Azure credentials."
-        ) from exc
+        )
+        logger.warning("Outlook tools unavailable: %s", exc)
+
+    try:
+        tools.extend(create_google_drive_tools())
+    except GoogleDriveIntegrationError as exc:  # pragma: no cover - example guardrail
+        configuration_errors.append(
+            "Google Drive integration is not configured. "
+            "Follow docs/deep_agent_example.md to provide credentials."
+        )
+        logger.warning("Google Drive tools unavailable: %s", exc)
+
+    if not tools:
+        raise RuntimeError("No integrations configured: " + " ".join(configuration_errors))
 
     logger.info("Coordinator loaded tools: %s", ", ".join(tool.name for tool in tools))
     return tools
