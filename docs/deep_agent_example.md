@@ -42,9 +42,11 @@ powered by LangGraph.
    ```
 
    These values are consumed by
-   [`create_outlook_tools`](../integrations/outlook.py#L214), which builds the
+   [`create_outlook_tools`](../integrations/outlook.py), which builds the
    LangChain tools that summarize the previous workday's email and calendar
-   activity.
+   activity. The Outlook integration also exposes a
+   `outlook_top_priority_emails` tool that scores messages using importance
+   flags, sender rules, and due dates so the agent can spotlight urgent emails.
 
 ## How the example works
 
@@ -77,7 +79,9 @@ narrative in this guide with the implementation details.
 3. The script prints the final response from the primary agent after delegating
    work to the research and writing sub-agents. When the Outlook integration is
    configured, the agent can call tools that summarize the previous workday's
-   emails and calendar events.
+   emails and calendar events. The final response now includes a **Top priorities**
+   section populated from the prioritization tool so you can immediately review
+   urgent messages.
 
 If you run into authentication errors, double-check that the `OPENAI_API_KEY`,
 `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_CLIENT_SECRET` environment

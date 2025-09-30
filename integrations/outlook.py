@@ -8,11 +8,13 @@ that they can be consumed by agents in the repository's examples.
 
 from __future__ import annotations
 
+import json
 import os
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 import msal
 import requests
@@ -63,12 +65,227 @@ class OutlookCredentials:
         )
 
 
+@dataclass
+class EmailPriorityRecommendation:
+    """Structured recommendation describing a prioritized email."""
+
+    subject: str
+    sender: str
+    received: Optional[str]
+    importance: str
+    score: float
+    reasons: List[str]
+    due_by: Optional[str]
+    sender_email: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "subject": self.subject,
+            "sender": self.sender,
+            "sender_email": self.sender_email,
+            "received": self.received,
+            "importance": self.importance,
+            "score": round(self.score, 2),
+            "reasons": self.reasons,
+            "due_by": self.due_by,
+        }
+
+
+class EmailPrioritizer:
+    """Apply heuristics to score Outlook messages based on urgency."""
+
+    DEFAULT_IMPORTANCE_WEIGHTS: Dict[str, float] = {
+        "high": 40.0,
+        "normal": 10.0,
+        "low": -5.0,
+    }
+
+    def __init__(
+        self,
+        *,
+        sender_weights: Optional[Dict[str, float]] = None,
+        domain_weights: Optional[Dict[str, float]] = None,
+        importance_weights: Optional[Dict[str, float]] = None,
+        flagged_weight: float = 15.0,
+        overdue_weight: float = 35.0,
+        due_soon_weight: float = 20.0,
+        due_soon_hours: int = 24,
+    ) -> None:
+        self.sender_weights = {
+            (email or "").lower(): weight
+            for email, weight in (sender_weights or {}).items()
+            if email
+        }
+        self.domain_weights = {
+            (domain or "").lstrip("@").lower(): weight
+            for domain, weight in (domain_weights or {}).items()
+            if domain
+        }
+        self.importance_weights = (
+            importance_weights or self.DEFAULT_IMPORTANCE_WEIGHTS
+        )
+        self.flagged_weight = flagged_weight
+        self.overdue_weight = overdue_weight
+        self.due_soon_weight = due_soon_weight
+        self.due_soon_window = timedelta(hours=max(due_soon_hours, 1))
+
+    @classmethod
+    def from_env(cls) -> "EmailPrioritizer":
+        """Build a prioritizer using optional environment configuration."""
+
+        def _parse_weight_mapping(raw: str, default_weight: float) -> Dict[str, float]:
+            mapping: Dict[str, float] = {}
+            for token in raw.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                if "=" in token:
+                    key, weight_str = token.split("=", 1)
+                    try:
+                        weight = float(weight_str.strip())
+                    except ValueError:
+                        weight = default_weight
+                else:
+                    key, weight = token, default_weight
+                mapping[key.strip()] = weight
+            return mapping
+
+        sender_weights = _parse_weight_mapping(
+            os.getenv("OUTLOOK_PRIORITY_SENDERS", ""), default_weight=30.0
+        )
+        domain_weights = _parse_weight_mapping(
+            os.getenv("OUTLOOK_PRIORITY_DOMAINS", ""), default_weight=20.0
+        )
+
+        importance_weights: Dict[str, float] = {}
+        importance_raw = os.getenv("OUTLOOK_IMPORTANCE_WEIGHTS")
+        if importance_raw:
+            try:
+                data = json.loads(importance_raw)
+                if isinstance(data, dict):
+                    for key, value in data.items():
+                        try:
+                            importance_weights[str(key).lower()] = float(value)
+                        except (TypeError, ValueError):
+                            continue
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Invalid JSON provided in OUTLOOK_IMPORTANCE_WEIGHTS; falling back to defaults."
+                )
+
+        try:
+            due_soon_hours = int(os.getenv("OUTLOOK_DEADLINE_SOON_HOURS", "24"))
+        except ValueError:
+            due_soon_hours = 24
+
+        try:
+            flagged_weight = float(os.getenv("OUTLOOK_FLAGGED_WEIGHT", "15"))
+        except ValueError:
+            flagged_weight = 15.0
+
+        try:
+            overdue_weight = float(os.getenv("OUTLOOK_OVERDUE_WEIGHT", "35"))
+        except ValueError:
+            overdue_weight = 35.0
+
+        try:
+            due_soon_weight = float(os.getenv("OUTLOOK_DUE_SOON_WEIGHT", "20"))
+        except ValueError:
+            due_soon_weight = 20.0
+
+        return cls(
+            sender_weights=sender_weights,
+            domain_weights=domain_weights,
+            importance_weights=importance_weights or None,
+            flagged_weight=flagged_weight,
+            overdue_weight=overdue_weight,
+            due_soon_weight=due_soon_weight,
+            due_soon_hours=due_soon_hours,
+        )
+
+    @staticmethod
+    def parse_due_datetime(
+        date_str: Optional[str], time_zone: Optional[str]
+    ) -> Optional[datetime]:
+        if not date_str:
+            return None
+        sanitized = date_str.replace("Z", "+00:00") if date_str.endswith("Z") else date_str
+        try:
+            parsed = datetime.fromisoformat(sanitized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            if time_zone:
+                try:
+                    parsed = parsed.replace(tzinfo=ZoneInfo(time_zone))
+                except Exception:
+                    parsed = parsed.replace(tzinfo=UTC)
+            else:
+                parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def score_email(self, email: Dict[str, Any]) -> Tuple[float, List[str]]:
+        """Return a score and rationale for the provided email record."""
+
+        score = 0.0
+        reasons: List[str] = []
+
+        importance = str(email.get("importance") or "normal").lower()
+        if importance in self.importance_weights:
+            importance_score = self.importance_weights[importance]
+            score += importance_score
+            reasons.append(f"Marked as {importance} importance")
+
+        sender_email = str(email.get("sender_email") or email.get("sender") or "").lower()
+        if sender_email in self.sender_weights:
+            weight = self.sender_weights[sender_email]
+            score += weight
+            reasons.append("Matches high-priority sender rule")
+        else:
+            domain = sender_email.split("@", 1)[-1] if "@" in sender_email else ""
+            if domain in self.domain_weights:
+                weight = self.domain_weights[domain]
+                score += weight
+                reasons.append("Matches high-priority domain rule")
+
+        if email.get("is_flagged"):
+            score += self.flagged_weight
+            reasons.append("Flagged for follow-up")
+
+        due_info = email.get("due_info", {})
+        due_dt = None
+        if isinstance(due_info, dict):
+            due_dt = self.parse_due_datetime(
+                due_info.get("dateTime"), due_info.get("timeZone")
+            )
+        elif isinstance(due_info, str):
+            due_dt = self.parse_due_datetime(due_info, None)
+
+        if due_dt:
+            now = datetime.now(tz=UTC)
+            if due_dt <= now:
+                score += self.overdue_weight
+                reasons.append("Deadline has passed")
+            elif due_dt - now <= self.due_soon_window:
+                score += self.due_soon_weight
+                reasons.append(
+                    f"Due within {int(self.due_soon_window.total_seconds() // 3600)}h"
+                )
+
+        return score, reasons
+
 class OutlookClient:
     """Minimal Graph API client tailored for the Deep Agent example."""
 
-    def __init__(self, credentials: OutlookCredentials, session: Optional[requests.Session] = None):
+    def __init__(
+        self,
+        credentials: OutlookCredentials,
+        session: Optional[requests.Session] = None,
+        prioritizer: Optional[EmailPrioritizer] = None,
+    ):
         self._credentials = credentials
         self._session = session or requests.Session()
+        self._prioritizer = prioritizer or EmailPrioritizer.from_env()
         self._app = msal.ConfidentialClientApplication(
             client_id=credentials.client_id,
             authority=f"https://login.microsoftonline.com/{credentials.tenant_id}",
@@ -150,30 +367,85 @@ class OutlookClient:
         end = start + timedelta(days=1)
         return {"start": start, "end": end}
 
-    def fetch_previous_day_emails(self) -> List[Dict[str, str]]:
+    def _normalize_due(self, flag_payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not flag_payload:
+            return None
+        due = flag_payload.get("dueDateTime")
+        if isinstance(due, dict) and due.get("dateTime"):
+            return due
+        return None
+
+    def fetch_previous_day_emails(self) -> List[Dict[str, Any]]:
         """Return structured metadata for emails received on the previous work day."""
 
         date_range = self._previous_workday_range()
         params = {
             "$top": "25",
             "$orderby": "receivedDateTime desc",
-            "$select": "subject,from,receivedDateTime",  # from is reserved but valid here
+            "$select": "subject,from,receivedDateTime,importance,flag",
             "$filter": (
                 "receivedDateTime ge {} and receivedDateTime lt {}"
             ).format(date_range["start"].isoformat(), date_range["end"].isoformat()),
         }
         data = self._authorized_get(f"{GRAPH_BASE_URL}/me/messages", params)
-        emails = []
+        emails: List[Dict[str, Any]] = []
         for item in data.get("value", []):
             sender = item.get("from", {}).get("emailAddress", {})
-            emails.append(
-                {
-                    "subject": item.get("subject", "(no subject)"),
-                    "sender": sender.get("name") or sender.get("address") or "Unknown",
-                    "received": item.get("receivedDateTime"),
-                }
-            )
+            flag_payload = item.get("flag") or {}
+            flag_status = str(flag_payload.get("flagStatus") or "").lower()
+            due_info = self._normalize_due(flag_payload)
+            normalized: Dict[str, Any] = {
+                "subject": item.get("subject", "(no subject)"),
+                "sender": sender.get("name") or sender.get("address") or "Unknown",
+                "sender_email": sender.get("address"),
+                "received": item.get("receivedDateTime"),
+                "importance": item.get("importance", "normal"),
+                "is_flagged": flag_status == "flagged",
+                "due_info": due_info,
+            }
+            score, reasons = self._prioritizer.score_email(normalized)
+            normalized["score"] = score
+            normalized["reasons"] = reasons
+            normalized["due_by"] = None
+            if due_info and isinstance(due_info, dict):
+                due_dt = self._prioritizer.parse_due_datetime(
+                    due_info.get("dateTime"), due_info.get("timeZone")
+                )
+                if due_dt:
+                    normalized["due_by"] = due_dt.isoformat()
+            emails.append(normalized)
         return emails
+
+    def prioritized_email_recommendations(
+        self, limit: int = 3
+    ) -> List[EmailPriorityRecommendation]:
+        """Return top-N scored emails based on prioritization heuristics."""
+
+        emails = self.fetch_previous_day_emails()
+        if not emails:
+            return []
+
+        ranked = sorted(
+            emails,
+            key=lambda payload: float(payload.get("score", 0.0)),
+            reverse=True,
+        )
+
+        recommendations: List[EmailPriorityRecommendation] = []
+        for email in ranked[: max(limit, 0)]:
+            recommendations.append(
+                EmailPriorityRecommendation(
+                    subject=str(email.get("subject")),
+                    sender=str(email.get("sender")),
+                    sender_email=email.get("sender_email"),
+                    received=email.get("received"),
+                    importance=str(email.get("importance", "normal")),
+                    score=float(email.get("score", 0.0)),
+                    reasons=list(email.get("reasons", [])),
+                    due_by=email.get("due_by"),
+                )
+            )
+        return recommendations
 
     def fetch_previous_day_events(self) -> List[Dict[str, str]]:
         """Return structured metadata for calendar events scheduled on the previous work day."""
@@ -209,14 +481,18 @@ class OutlookClient:
             )
         return events
 
-    def summarize_emails(self, emails: Iterable[Dict[str, str]]) -> str:
+    def summarize_emails(self, emails: Iterable[Dict[str, Any]]) -> str:
         lines = ["Previous workday email highlights:"]
         for email in emails:
             received = email.get("received")
             timestamp = self._format_time(received, default="Unknown time")
-            lines.append(
-                f"- {email.get('subject')} from {email.get('sender')} at {timestamp}"
-            )
+            description = f"- {email.get('subject')} from {email.get('sender')} at {timestamp}"
+            if email.get("due_by"):
+                due_display = self._format_time(email.get("due_by"), default="Unknown deadline")
+                description += f" (due by {due_display})"
+            if email.get("score") is not None:
+                description += f" [score: {float(email.get('score', 0.0)):.1f}]"
+            lines.append(description)
         if len(lines) == 1:
             lines.append("- No email activity detected during the previous work day.")
         return "\n".join(lines)
@@ -386,6 +662,13 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
     def calendar_summary_tool(_: str = "") -> str:
         return client.previous_day_calendar_summary()
 
+    def prioritized_email_tool(*, limit: int = 3) -> str:
+        recommendations = client.prioritized_email_recommendations(limit=limit)
+        payload = {
+            "recommendations": [recommendation.as_dict() for recommendation in recommendations]
+        }
+        return json.dumps(payload, indent=2)
+
     class SendMailInput(BaseModel):
         """Schema for composing and sending a new Outlook email."""
 
@@ -490,6 +773,16 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
             description="Whether Outlook should send a response email.",
         )
 
+    class PrioritizedEmailsInput(BaseModel):
+        """Schema for requesting prioritized email recommendations."""
+
+        limit: int = Field(
+            default=3,
+            ge=1,
+            le=25,
+            description="Number of top priority emails to include in the response.",
+        )
+
     tools: List[Tool] = [
         Tool(
             name="outlook_email_summary",
@@ -498,6 +791,15 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
                 "subjects, senders, and timestamps."
             ),
             func=email_summary_tool,
+        ),
+        StructuredTool.from_function(
+            name="outlook_top_priority_emails",
+            description=(
+                "Return the highest priority emails from the previous work day using "
+                "importance flags, sender rules, and deadlines."
+            ),
+            func=prioritized_email_tool,
+            args_schema=PrioritizedEmailsInput,
         ),
         Tool(
             name="outlook_calendar_summary",
@@ -561,5 +863,7 @@ __all__ = [
     "OutlookClient",
     "OutlookCredentials",
     "OutlookIntegrationError",
+    "EmailPriorityRecommendation",
+    "EmailPrioritizer",
     "create_outlook_tools",
 ]
