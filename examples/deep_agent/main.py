@@ -180,6 +180,9 @@ def build_primary_agent(llm: BaseChatModel, tools: Iterable[BaseTool]) -> AgentE
                 (
                     "You are the coordinator. When appropriate, call the provided tools "
                     '"delegate_to_<name>" to request help from specialized sub-agents. "'
+                    "Use the Outlook daily briefing tool when the user asks for a "
+                    "combined recap of email and calendar activity from the previous "
+                    "workday. "
                     "Use Outlook action tools (send, reply, forward, schedule meetings, "
                     "respond to invites) only after the user has explicitly confirmed "
                     "the intent, recipients, timing, and message contents. Always note "
