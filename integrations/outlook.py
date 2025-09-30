@@ -8,11 +8,12 @@ that they can be consumed by agents in the repository's examples.
 
 from __future__ import annotations
 
+import json
 import os
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import msal
 import requests
@@ -74,6 +75,7 @@ class OutlookClient:
             authority=f"https://login.microsoftonline.com/{credentials.tenant_id}",
             client_credential=credentials.client_secret,
         )
+        self._priority_sender_weights = self._load_priority_sender_weights()
 
     def _get_access_token(self) -> str:
         result = self._app.acquire_token_silent(scopes=GRAPH_SCOPE, account=None)
@@ -150,14 +152,16 @@ class OutlookClient:
         end = start + timedelta(days=1)
         return {"start": start, "end": end}
 
-    def fetch_previous_day_emails(self) -> List[Dict[str, str]]:
+    def fetch_previous_day_emails(self) -> List[Dict[str, Any]]:
         """Return structured metadata for emails received on the previous work day."""
 
         date_range = self._previous_workday_range()
         params = {
             "$top": "25",
             "$orderby": "receivedDateTime desc",
-            "$select": "subject,from,receivedDateTime",  # from is reserved but valid here
+            "$select": (
+                "subject,from,receivedDateTime,importance,flag"
+            ),  # from is reserved but valid here
             "$filter": (
                 "receivedDateTime ge {} and receivedDateTime lt {}"
             ).format(date_range["start"].isoformat(), date_range["end"].isoformat()),
@@ -165,15 +169,165 @@ class OutlookClient:
         data = self._authorized_get(f"{GRAPH_BASE_URL}/me/messages", params)
         emails = []
         for item in data.get("value", []):
-            sender = item.get("from", {}).get("emailAddress", {})
-            emails.append(
-                {
-                    "subject": item.get("subject", "(no subject)"),
-                    "sender": sender.get("name") or sender.get("address") or "Unknown",
-                    "received": item.get("receivedDateTime"),
-                }
-            )
+            emails.append(self._build_email_record(item))
         return emails
+
+    def _build_email_record(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        sender = item.get("from", {}).get("emailAddress", {})
+        subject = item.get("subject", "(no subject)")
+        sender_name = sender.get("name") or sender.get("address") or "Unknown"
+        sender_address = (sender.get("address") or "").lower()
+        received_iso = item.get("receivedDateTime")
+        importance = (item.get("importance") or "normal").lower()
+        flag = item.get("flag") or {}
+        flag_status = (flag.get("flagStatus") or "notFlagged").lower()
+        due_date_iso = (flag.get("dueDateTime") or {}).get("dateTime")
+
+        score, reasons = self._score_email(
+            importance=importance,
+            sender_address=sender_address,
+            due_date_iso=due_date_iso,
+            flag_status=flag_status,
+            received_iso=received_iso,
+        )
+
+        return {
+            "subject": subject,
+            "sender": sender_name,
+            "sender_address": sender_address,
+            "received": received_iso,
+            "importance": importance,
+            "flag_status": flag_status,
+            "due_date": due_date_iso,
+            "priority_score": score,
+            "priority_reasons": reasons,
+        }
+
+    def prioritized_previous_day_emails(self, *, limit: int = 5) -> List[Dict[str, Any]]:
+        """Return the highest priority emails from the previous work day."""
+
+        emails = self.fetch_previous_day_emails()
+        if not emails:
+            return []
+
+        def sort_key(email: Dict[str, Any]) -> Tuple[int, datetime]:
+            received_dt = self._parse_datetime(email.get("received"))
+            if received_dt is None:
+                received_dt = datetime.min.replace(tzinfo=UTC)
+            return email.get("priority_score", 0), received_dt
+
+        ranked = sorted(emails, key=sort_key, reverse=True)
+        return ranked[: max(1, limit)]
+
+    def _score_email(
+        self,
+        *,
+        importance: str,
+        sender_address: str,
+        due_date_iso: Optional[str],
+        flag_status: str,
+        received_iso: Optional[str],
+    ) -> Tuple[int, List[str]]:
+        score = 0
+        reasons: List[str] = []
+
+        importance_level = (importance or "normal").lower()
+        if importance_level == "high":
+            score += 3
+            reasons.append("Marked as high importance")
+        elif importance_level == "low":
+            score -= 1
+            reasons.append("Marked as low importance")
+
+        sender_weight = 0
+        normalized_sender = (sender_address or "").lower()
+        if normalized_sender:
+            sender_weight = self._match_sender_weight(normalized_sender)
+        if sender_weight:
+            score += sender_weight
+            reasons.append(
+                f"Sender matches priority rules (+{sender_weight})"
+            )
+
+        if flag_status == "flagged":
+            score += 1
+            reasons.append("Message is flagged for follow-up")
+
+        due_dt = self._parse_datetime(due_date_iso)
+        if due_dt is not None:
+            now = datetime.now(tz=UTC)
+            if due_dt < now:
+                score += 3
+                reasons.append("Flag due date has passed")
+            elif due_dt <= now + timedelta(days=1):
+                score += 2
+                reasons.append("Flag due within 24 hours")
+            elif due_dt <= now + timedelta(days=2):
+                score += 1
+                reasons.append("Flag due within 48 hours")
+
+        received_dt = self._parse_datetime(received_iso)
+        if received_dt is not None:
+            age = datetime.now(tz=UTC) - received_dt
+            if age <= timedelta(hours=4):
+                score += 1
+                reasons.append("Received within the last 4 hours")
+
+        if not reasons:
+            reasons.append("No priority signals detected")
+
+        return score, reasons
+
+    def _match_sender_weight(self, sender: str) -> int:
+        if not self._priority_sender_weights:
+            return 0
+
+        weight = self._priority_sender_weights.get(sender)
+        if weight:
+            return weight
+
+        for rule, rule_weight in self._priority_sender_weights.items():
+            if rule.startswith("@") and sender.endswith(rule):
+                return rule_weight
+        return 0
+
+    @staticmethod
+    def _load_priority_sender_weights() -> Dict[str, int]:
+        raw = os.getenv("OUTLOOK_PRIORITY_SENDERS", "")
+        weights: Dict[str, int] = {}
+        if not raw:
+            return weights
+
+        for entry in raw.split(","):
+            cleaned = entry.strip()
+            if not cleaned:
+                continue
+            if ":" in cleaned:
+                sender, weight_str = cleaned.split(":", 1)
+                sender = sender.strip().lower()
+                try:
+                    weight = int(weight_str.strip())
+                except ValueError:
+                    weight = 3
+            else:
+                sender = cleaned.lower()
+                weight = 3
+            if sender:
+                weights[sender] = weight
+        return weights
+
+    @staticmethod
+    def _parse_datetime(iso_ts: Optional[str]) -> Optional[datetime]:
+        if not iso_ts:
+            return None
+        sanitized = iso_ts.replace("Z", "+00:00") if iso_ts.endswith("Z") else iso_ts
+        try:
+            dt = datetime.fromisoformat(sanitized)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
 
     def fetch_previous_day_events(self) -> List[Dict[str, str]]:
         """Return structured metadata for calendar events scheduled on the previous work day."""
@@ -209,7 +363,7 @@ class OutlookClient:
             )
         return events
 
-    def summarize_emails(self, emails: Iterable[Dict[str, str]]) -> str:
+    def summarize_emails(self, emails: Iterable[Dict[str, Any]]) -> str:
         lines = ["Previous workday email highlights:"]
         for email in emails:
             received = email.get("received")
@@ -247,6 +401,33 @@ class OutlookClient:
 
     def previous_day_email_summary(self) -> str:
         return self.summarize_emails(self.fetch_previous_day_emails())
+
+    def previous_day_priority_digest(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Return prioritized email metadata for downstream tools."""
+
+        prioritized = self.prioritized_previous_day_emails(limit=limit)
+        digest: List[Dict[str, Any]] = []
+        for email in prioritized:
+            digest.append(
+                {
+                    "subject": email.get("subject"),
+                    "sender": email.get("sender"),
+                    "sender_address": email.get("sender_address"),
+                    "received": email.get("received"),
+                    "received_display": self._format_time(
+                        email.get("received"), default="Unknown time"
+                    ),
+                    "due_date": email.get("due_date"),
+                    "due_display": self._format_time(
+                        email.get("due_date"), default="No deadline"
+                    ),
+                    "importance": email.get("importance"),
+                    "flag_status": email.get("flag_status"),
+                    "priority_score": email.get("priority_score"),
+                    "priority_reasons": email.get("priority_reasons", []),
+                }
+            )
+        return digest
 
     def previous_day_calendar_summary(self) -> str:
         return self.summarize_events(self.fetch_previous_day_events())
@@ -415,6 +596,16 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
                 return [value]
             return list(value)
 
+    class TopEmailPrioritiesInput(BaseModel):
+        """Schema for requesting prioritized Outlook emails."""
+
+        limit: int = Field(
+            default=3,
+            ge=1,
+            le=25,
+            description="Maximum number of prioritized emails to return.",
+        )
+
     class ReplyToMessageInput(BaseModel):
         """Schema for replying to an existing Outlook email."""
 
@@ -490,6 +681,11 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
             description="Whether Outlook should send a response email.",
         )
 
+    def prioritized_email_tool(limit: int = 3) -> str:
+        digest = client.previous_day_priority_digest(limit=limit)
+        payload = {"top_priorities": digest, "limit": limit}
+        return json.dumps(payload, indent=2)
+
     tools: List[Tool] = [
         Tool(
             name="outlook_email_summary",
@@ -506,6 +702,15 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
                 "and key attendees."
             ),
             func=calendar_summary_tool,
+        ),
+        StructuredTool.from_function(
+            name="outlook_top_email_priorities",
+            description=(
+                "Return the highest priority Outlook emails from the previous work day "
+                "based on importance markers, sender rules, and follow-up deadlines."
+            ),
+            func=prioritized_email_tool,
+            args_schema=TopEmailPrioritiesInput,
         ),
         StructuredTool.from_function(
             name="outlook_send_mail",

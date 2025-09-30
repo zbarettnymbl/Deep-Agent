@@ -43,9 +43,14 @@ powered by LangGraph.
    ```
 
    These values are consumed by
-   [`create_outlook_tools`](../integrations/outlook.py#L214), which builds the
+   [`create_outlook_tools`](../integrations/outlook.py), which builds the
    LangChain tools that summarize the previous workday's email and calendar
-   activity.
+   activity. Optionally, set `OUTLOOK_PRIORITY_SENDERS` to a comma-separated
+   list of prioritized email addresses (or `@domain.com` domain rules). You can
+   assign weights with `address:weight` pairs (for example,
+   `ceo@example.com:5,@executive.example.com:4`). These rules feed the
+   `outlook_top_email_priorities` tool that highlights urgent follow-ups in the
+   agent's final response.
 
 5. **Google Drive access** – Choose one of the following authentication flows
    so the example can call the Drive metadata APIs:
