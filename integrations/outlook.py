@@ -251,6 +251,21 @@ class OutlookClient:
     def previous_day_calendar_summary(self) -> str:
         return self.summarize_events(self.fetch_previous_day_events())
 
+    def previous_day_briefing(self) -> str:
+        """Combine email and calendar summaries into a single briefing."""
+
+        email_summary = self.previous_day_email_summary()
+        calendar_summary = self.previous_day_calendar_summary()
+        briefing_lines = [
+            "Previous workday briefing:",
+            "Here is a combined snapshot of your inbox activity and meetings.",
+            "",
+            email_summary,
+            "",
+            calendar_summary,
+        ]
+        return "\n".join(briefing_lines)
+
     def send_mail(
         self,
         *,
@@ -386,6 +401,9 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
     def calendar_summary_tool(_: str = "") -> str:
         return client.previous_day_calendar_summary()
 
+    def daily_briefing_tool(_: str = "") -> str:
+        return client.previous_day_briefing()
+
     class SendMailInput(BaseModel):
         """Schema for composing and sending a new Outlook email."""
 
@@ -506,6 +524,14 @@ def create_outlook_tools(client: Optional[OutlookClient] = None) -> List[Tool]:
                 "and key attendees."
             ),
             func=calendar_summary_tool,
+        ),
+        Tool(
+            name="outlook_daily_briefing",
+            description=(
+                "Provide a combined previous workday briefing that blends email "
+                "highlights with the calendar overview."
+            ),
+            func=daily_briefing_tool,
         ),
         StructuredTool.from_function(
             name="outlook_send_mail",
