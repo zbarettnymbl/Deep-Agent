@@ -7,9 +7,9 @@ readers can match conceptual descriptions with the relevant code.
 """
 
 # --- Model Setup -----------------------------------------------------------
-"""Utilities for configuring language models and tools used by the agents."""
-
 from __future__ import annotations
+
+"""Utilities for configuring language models and tools used by the agents."""
 
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, TypedDict
@@ -23,6 +23,7 @@ from langchain_core.tools import BaseTool, Tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
+from integrations.outlook import OutlookIntegrationError, create_outlook_tools
 
 def initialize_llm(
     *,
@@ -47,34 +48,15 @@ def initialize_llm(
 
 
 def initialize_tools() -> List[BaseTool]:
-    """Define the shared tool set exposed to the agent ecosystem.
+    """Define the shared tool set exposed to the agent ecosystem."""
 
-    The tools are intentionally simple so the example runs without external
-    services. They still illustrate how to register custom capabilities that can
-    be invoked from both the primary agent and LangGraph sub-agents.
-    """
-
-    def summarize(text: str) -> str:
-        return f"Summary: {text[:200]}..." if len(text) > 200 else f"Summary: {text}"
-
-    def retrieve(keyword: str) -> str:
-        return (
-            "Retrieved knowledge about {keyword}. "
-            "Replace this with a vector store or API call in production"
-        ).format(keyword=keyword)
-
-    return [
-        Tool(
-            name="summarizer",
-            description="Summarize short passages or agent outputs.",
-            func=summarize,
-        ),
-        Tool(
-            name="retriever",
-            description="Retrieve lightweight context for a given keyword.",
-            func=retrieve,
-        ),
-    ]
+    try:
+        return create_outlook_tools()
+    except OutlookIntegrationError as exc:  # pragma: no cover - example guardrail
+        raise RuntimeError(
+            "Outlook integration is not configured. "
+            "Follow docs/deep_agent_example.md to provide Azure credentials."
+        ) from exc
 
 
 # --- Graph Definition ------------------------------------------------------
@@ -168,8 +150,10 @@ def build_primary_agent(llm: BaseChatModel, tools: Iterable[BaseTool]) -> AgentE
         [
             (
                 "system",
-                "You are the coordinator. When appropriate, call the provided tools \"
-                "delegate_to_<name>\" to request help from specialized sub-agents."
+                (
+                    "You are the coordinator. When appropriate, call the provided tools "
+                    '"delegate_to_<name>" to request help from specialized sub-agents.'
+                ),
             ),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}"),
