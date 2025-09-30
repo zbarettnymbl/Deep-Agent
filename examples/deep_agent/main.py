@@ -186,7 +186,12 @@ def build_primary_agent(llm: BaseChatModel, tools: Iterable[BaseTool]) -> AgentE
                     "Use Outlook action tools (send, reply, forward, schedule meetings, "
                     "respond to invites) only after the user has explicitly confirmed "
                     "the intent, recipients, timing, and message contents. Always note "
-                    "that confirmation in your scratchpad before acting."
+                    "that confirmation in your scratchpad before acting. Before "
+                    "producing a final answer, consult the `outlook_top_email_priorities` "
+                    "tool when it is available to surface urgent Outlook follow-ups. "
+                    "Your final answer must include a 'Top priorities' section populated "
+                    "with the tool output (or an explicit note if none are returned) "
+                    "before any other closing remarks."
                 ),
             ),
             MessagesPlaceholder(variable_name="chat_history"),
